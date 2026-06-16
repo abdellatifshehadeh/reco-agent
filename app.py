@@ -655,7 +655,7 @@ with tab_run:
                 st.dataframe(bd[['currency','cust_opening','cust_closing','zag_opening','zag_closing','difference','status']]
                              .rename(columns={'currency':'CCY','cust_opening':'Cust Open','cust_closing':'Cust Close',
                                               'zag_opening':'ZAG Open','zag_closing':'ZAG Close','difference':'Diff','status':'Status'})
-                             .style.applymap(cs,subset=['Status']),use_container_width=True,hide_index=True)
+                             .style.map(cs,subset=["Status"]),use_container_width=True,hide_index=True)
 
                 # Breaks preview
                 if len(breaks)>0:
@@ -719,4 +719,3 @@ with tab_help:
     - Income/dividend date tolerance: **15 days**
     - Settlement tolerance: **5 days**
     """)
-ENDOFFILE
