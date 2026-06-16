@@ -170,9 +170,15 @@ def _lastbal(grp):
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. MATCHING ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-_TYPE_MAP={'RECEIVE VS PAYMENT':['SETTLEMENT','TRADEID'],'DELIVER VS PAYMENT':['SETTLEMENT','TRADEID'],
-           'CASH DEPOSIT':['TRANSFER FROM','WIRE IN','DEPOSIT'],'CASH WITHDRAWAL':['WIRE OUT','TRANSFER TO'],
-           'CA DIVIDEND':['CASH DIVIDEND','DIVIDEND','DIV'],'CA INCOME':['CREDIT COUPON','COUPON','INTR']}
+_TYPE_MAP={
+    'RECEIVE VS PAYMENT': ['SETTLEMENT','TRADEID','RECEIVE'],
+    'DELIVER VS PAYMENT': ['SETTLEMENT','TRADEID','DELIVER'],
+    'CASH DEPOSIT':       ['TRANSFER FROM','WIRE IN','DEPOSIT','TRANSFER GTN','TRANSFER MAREX','TRANSFER SUCDEN','TRANSFER CGS','TRANSFER MASHREQ','TRANSFER ARDSHIN','TRANSFER MAYBANK','TRANSFER GIS','TRANSFER EMRGO'],
+    'CASH WITHDRAWAL':    ['WIRE OUT','TRANSFER TO','TRANSFER FAB','TRANSFER FROM FAB'],
+    'CA PAY DUE':         ['BOND MATURED','FI REDM','FI MCAL','MATURITY','SALE OF SECURITY','BOND EARLY'],
+    'CA DIVIDEND':        ['CASH DIVIDEND','DIVIDEND','DIV'],
+    'CA INCOME':          ['CREDIT COUPON','COUPON','INTR','CA INCOME'],
+}
 _INCOME_TYPES={'CA DIVIDEND','CA INCOME','CA INCOME (INTR)','CA PAY DUE'}
 _INCOME_ZAG=('DIVIDEND','COUPON','INTR','INCOME','CREDIT COUPON')
 
@@ -183,7 +189,15 @@ def _clean(t):
         t=re.sub(p,' ',t)
     return t.strip()
 
+_WIRE_FAB_TYPES  = {'CASH DEPOSIT T24','CASH DEPOSIT*','CASH WITHDRAWAL T24','CASH WITHDRAWAL*','CASH OUT*'}
+_WIRE_ZAG_DESCS  = ('WIRE IN','WIRE OUT','TRANSFER FROM','TRANSFER TO','TRANSFER FAB')
+
 def _score(fd,ft,zd,zr,zc=''):
+    # T24 wire transfers: skip narrative, match on amount+date alone
+    ftU = str(ft or '').upper()
+    zdU = str(zd or '').upper()
+    if any(t in ftU for t in _WIRE_FAB_TYPES) and any(k in zdU for k in _WIRE_ZAG_DESCS):
+        return 'HIGH','wire_t24_transfer'
     fk=_clean(fd+' '+ft); zk=_clean(str(zd)+' '+str(zr or '')+' '+str(zc or ''))
     ftk=_clean(ft)
     for key,hints in _TYPE_MAP.items():
@@ -221,6 +235,13 @@ def reconcile(cust_df, zag_df):
                     conf,m=_score(cr.get('description',''),cr.get('txn_type',''),zr.get('description',''),zr.get('ref',''),zr.get('component_descs',''))
                     results.append(_mrow(ccy,cr,zr,ca,za,'MATCHED',conf,f'exact|{m}',''))
                     cu[ci]=True; zu[zi]=True; break
+                # Pass 1b: T24 wire — amount match within 10 + same date (bank fee absorbed)
+                ftU=str(cr.get('txn_type') or '').upper()
+                zdU=str(zr.get('description') or '').upper()
+                is_wire=any(t in ftU for t in _WIRE_FAB_TYPES) and any(k in zdU for k in _WIRE_ZAG_DESCS)
+                if is_wire and abs(abs(ca)-abs(za))<10 and pd.notna(cd) and pd.notna(zd) and pd.Timestamp(cd).date()==pd.Timestamp(zd).date():
+                    results.append(_mrow(ccy,cr,zr,ca,za,'MATCHED','HIGH','wire_t24_fee_absorbed',f'Amt diff {round(abs(abs(ca)-abs(za)),2)} (fee)'))
+                    cu[ci]=True; zu[zi]=True; break
         # Pass 2: amount + tolerance
         for ci,cr in cust.iterrows():
             if cu[ci]: continue
@@ -237,6 +258,54 @@ def reconcile(cust_df, zag_df):
                     lbl='income_delay' if tol==15 else 'settle_timing'
                     results.append(_mrow(ccy,cr,zr,ca,za,'MATCHED',conf,f'amt+{dd}d({lbl})|{m}',f'Date diff {dd}d'))
                     cu[ci]=True; zu[zi]=True; break
+        # Pass 3: aggregate ZAG coupon lines by security name → match FAB CA Income/Dividend
+        # Group unmatched ZAG coupon lines by security ticker extracted from description
+        fab_income = [(ci,cr) for ci,cr in cust.iterrows()
+                      if not cu[ci] and any(t in str(cr.get('txn_type') or '').upper()
+                                             for t in ('CA INCOME','CA DIVIDEND','CA PAY DUE'))]
+        zag_coupons = [(zi,zr) for zi,zr in zag.iterrows()
+                       if not zu[zi] and any(k in str(zr.get('description') or '').upper()
+                                              for k in ('CREDIT COUPON','CASH DIVIDEND','BOND MATURED','FI REDM','SALE OF SECURITY'))]
+        if fab_income and zag_coupons:
+            # Group ZAG coupons by date bucket (same day)
+            from collections import defaultdict
+            zag_by_date = defaultdict(list)
+            for zi,zr in zag_coupons:
+                zd = pd.Timestamp(zr.get('trade_date') or zr.get('settlement_date'))
+                zag_by_date[zd.date()].append((zi,zr))
+            for ci,cr in fab_income:
+                ca=_signed(cr); cd=pd.Timestamp(cr.get('settlement_date') or cr.get('trade_date'))
+                tol=_tol(cr.get('txn_type',''),'COUPON')
+                # Look for ZAG lines within tolerance whose sum matches FAB amount
+                for ddate, zrows in zag_by_date.items():
+                    try: diff_days=abs((cd.date()-ddate).days)
+                    except: continue
+                    if diff_days>tol: continue
+                    avail=[(zi,zr) for zi,zr in zrows if not zu[zi]]
+                    if not avail: continue
+                    zsum=sum(abs(_signed(zr)) for _,zr in avail)
+                    if abs(abs(ca)-zsum)<0.05:
+                        # Full group matches
+                        for zi,zr in avail: zu[zi]=True
+                        cu[ci]=True
+                        zr0=avail[0][1]
+                        results.append(_mrow(ccy,cr,zr0,ca,-zsum,'MATCHED','HIGH',
+                                             f'coupon_agg_{len(avail)}lines',
+                                             f'Sum of {len(avail)} ZAG coupon lines = {round(zsum,2)}'))
+                        break
+                    # Try subsets of 2
+                    if len(avail)>=2:
+                        for i,(zi1,zr1) in enumerate(avail):
+                            for zi2,zr2 in avail[i+1:]:
+                                if zu[zi1] or zu[zi2]: continue
+                                s2=abs(_signed(zr1))+abs(_signed(zr2))
+                                if abs(abs(ca)-s2)<0.05:
+                                    zu[zi1]=True; zu[zi2]=True; cu[ci]=True
+                                    results.append(_mrow(ccy,cr,zr1,ca,-s2,'MATCHED','HIGH',
+                                                         'coupon_agg_2lines',f'Sum of 2 ZAG lines = {round(s2,2)}'))
+                                    break
+                            if cu[ci]: break
+
         for ci,cr in cust.iterrows():
             if not cu[ci]: results.append(_ucust(ccy,cr,_signed(cr)))
         for zi,zr in zag.iterrows():
